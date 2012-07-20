@@ -95,22 +95,18 @@ hash_item *do_item_alloc(struct default_engine *engine,
     if (id == 0)
         return 0;
 
-    /* do a quick check if we have any expired items in the tail.. */
-    int tries = search_items;
-    hash_item *search;
+    hash_item *tail = engine->items.tails[id];
     rel_time_t oldest_live = engine->config.oldest_live;
     rel_time_t current_time = engine->server.core->get_current_time();
 
-    for (search = engine->items.tails[id];
-         tries > 0 && search != NULL;
-         tries--, search=search->prev) {
-        if (search->refcount == 0 &&
-            ((search->time < oldest_live) || // dead by flush
-             (search->exptime != 0 && search->exptime < current_time))) {
-            it = search;
-            /* I don't want to actually free the object, just steal
-             * the item to avoid to grab the slab mutex twice ;-)
-             */
+    /* See if last item in the LRU is expired.
+     * If it is, we can write new item over the expired one.
+     */
+
+    if (tail != NULL && tail->refcount == 0) {
+        if ((tail->time < oldest_live) || // dead by flush
+         (tail->exptime != 0 && tail->exptime < current_time)) {
+            it = tail;
             pthread_mutex_lock(&engine->stats.lock);
             engine->stats.reclaimed++;
             pthread_mutex_unlock(&engine->stats.lock);
@@ -121,41 +117,37 @@ hash_item *do_item_alloc(struct default_engine *engine,
             /* Initialize the item block: */
             it->slabs_clsid = 0;
             it->refcount = 0;
-            break;
         }
     }
 
-    if (it == NULL && (it = slabs_alloc(engine, ntotal, id)) == NULL) {
-        /*
-        ** Could not find an expired item at the tail, and memory allocation
-        ** failed. Try to evict some items!
-        */
-        tries = search_items;
+    if (it == NULL && (it = slabs_alloc(engine, ntotal, id)) == NULL) { /* need to free up space */
 
         /* If requested to not push old items out of cache when memory runs out,
          * we're out of luck at this point...
          */
-
         if (engine->config.evict_to_free == 0) {
             engine->items.itemstats[id].outofmemory++;
             return NULL;
         }
-
-        /*
-         * try to get one off the right LRU
-         * don't necessariuly unlink the tail because it may be locked: refcount>0
-         * search up from tail an item with refcount==0 and unlink it; give up after search_items
-         * tries
-         */
 
         if (engine->items.tails[id] == 0) {
             engine->items.itemstats[id].outofmemory++;
             return NULL;
         }
 
+        /*
+         * try to get one off the correct LRU
+         * don't necessarily unlink the tail because it may be locked: refcount>0
+         * search up from tail an item with refcount==0 and unlink it; give up after search_items
+         * tries
+         */
+
+        int tries = search_items;
+        hash_item *search;
+
         for (search = engine->items.tails[id]; tries > 0 && search != NULL; tries--, search=search->prev) {
             if (search->refcount == 0) {
-                if (search->exptime == 0 || search->exptime > current_time) {
+                if (search->time >= oldest_live && (search->exptime == 0 || search->exptime > current_time)) {
                     engine->items.itemstats[id].evicted++;
                     engine->items.itemstats[id].evicted_time = current_time - search->time;
                     if (search->exptime != 0) {
@@ -167,17 +159,25 @@ hash_item *do_item_alloc(struct default_engine *engine,
                     engine->server.stat->evicting(cookie,
                                                   item_get_key(search),
                                                   search->nkey);
+                    do_item_unlink(engine, search);
+                    it = slabs_alloc(engine, ntotal, id);
                 } else {
-                    engine->items.itemstats[id].reclaimed++;
+                    it = search;
                     pthread_mutex_lock(&engine->stats.lock);
                     engine->stats.reclaimed++;
                     pthread_mutex_unlock(&engine->stats.lock);
+                    engine->items.itemstats[id].reclaimed++;
+                    it->refcount = 1;
+                    slabs_adjust_mem_requested(engine, it->slabs_clsid, ITEM_ntotal(engine, it), ntotal);
+                    do_item_unlink(engine, it);
+                    /* Initialize the item block: */
+                    it->slabs_clsid = 0;
+                    it->refcount = 0;
                 }
-                do_item_unlink(engine, search);
                 break;
             }
         }
-        it = slabs_alloc(engine, ntotal, id);
+
         if (it == 0) {
             engine->items.itemstats[id].outofmemory++;
             /* Last ditch effort. There is a very rare bug which causes
